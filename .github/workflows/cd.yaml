@@ -1,0 +1,141 @@
+name: CD Pipeline
+
+# Packages the champion config as containers once CI promotes it. Fires when
+# "CI Pipeline" (ci.yaml) finishes: its jobs are a linear needs: chain
+# (experiment -> regression-test -> promotion-test -> promote), so a
+# conclusion of `success` only happens when both gates passed AND
+# promote_challenger.py ran -- a rejected challenger fails an earlier job and
+# the whole run's conclusion becomes `failure`. workflow_dispatch is a manual
+# escape hatch to test this workflow without waiting on a full CI run.
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_API_REPOSITORY: campusx-rag-api
+  ECR_FRONTEND_REPOSITORY: campusx-rag-frontend
+  # CodeDeploy rollout (see deploy/codedeploy/ and codedeploy_steps.md). These
+  # names are contractual -- the console resources must match them exactly.
+  DEPLOY_BUCKET: campusx-rag-codedeploy
+  CODEDEPLOY_APP: campusx-rag
+  CODEDEPLOY_GROUP: campusx-rag-dg
+
+jobs:
+  build-and-push:
+    name: Build & push images to ECR
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    timeout-minutes: 30
+    steps:
+      - name: Check out the promoted commit
+        uses: actions/checkout@v7 # v7.0.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6 # v6.2.4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure ECR repositories exist
+        run: |
+          for repo in "$ECR_API_REPOSITORY" "$ECR_FRONTEND_REPOSITORY"; do
+            aws ecr describe-repositories --repository-names "$repo" --region "$AWS_REGION" >/dev/null 2>&1 \
+              || aws ecr create-repository --repository-name "$repo" --region "$AWS_REGION"
+          done
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Resolve image tag
+        id: vars
+        run: echo "sha=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push API image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.api
+          push: true
+          secrets: |
+            openai_api_key=${{ secrets.OPENAI_API_KEY }}
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_API_REPOSITORY }}:${{ steps.vars.outputs.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_API_REPOSITORY }}:latest
+
+      - name: Build & push frontend image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.frontend
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_FRONTEND_REPOSITORY }}:${{ steps.vars.outputs.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_FRONTEND_REPOSITORY }}:latest
+
+  deploy:
+    name: Roll out to EC2 via CodeDeploy
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Action versions web-verified against upstream releases on 2026-09-09:
+      # actions/checkout v7.0.1, aws-actions/configure-aws-credentials v6.2.4.
+      - name: Check out the promoted commit
+        uses: actions/checkout@v7 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6 # v6.2.4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Assemble the CodeDeploy revision bundle
+        run: |
+          set -euo pipefail
+          mkdir -p bundle/scripts
+          cp deploy/codedeploy/appspec.yml bundle/
+          cp deploy/codedeploy/docker-compose.yml bundle/
+          cp deploy/codedeploy/scripts/*.sh bundle/scripts/
+          chmod +x bundle/scripts/*.sh
+
+      - name: Upload the revision to S3
+        id: rev
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          KEY="campusx-rag/${SHA}.zip"
+          ( cd bundle && zip -qr ../revision.zip . )
+          aws s3 cp revision.zip "s3://${DEPLOY_BUCKET}/${KEY}"
+          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Create the deployment
+        run: |
+          set -euo pipefail
+          # Fire and forget: this job goes green once CodeDeploy accepts the
+          # deployment. Track the rollout (and any rollback) in the console link.
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name "$CODEDEPLOY_APP" \
+            --deployment-group-name "$CODEDEPLOY_GROUP" \
+            --deployment-config-name CodeDeployDefault.OneAtATime \
+            --s3-location "bucket=${DEPLOY_BUCKET},key=${{ steps.rev.outputs.key }},bundleType=zip" \
+            --file-exists-behavior OVERWRITE \
+            --description "CD ${{ github.event.workflow_run.head_sha || github.sha }}" \
+            --query deploymentId --output text)
+          echo "Deployment $DEPLOYMENT_ID"
+          echo "https://console.aws.amazon.com/codesuite/codedeploy/deployments/${DEPLOYMENT_ID}?region=${AWS_REGION}"
